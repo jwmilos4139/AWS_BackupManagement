@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Deploys a Lambda function to delete backups older than a specified number of days from an AWS Backup vault."
+
+Parameters:
+  BackupVaultName:
+    Type: String
+    Description: "Name of the AWS Backup Vault"
+
+  ExpiryDays:
+    Type: Number
+    Default: 365
+    Description: "Number of days after which backups should be deleted"
+
+Resources:
+  # IAM Role for Lambda function
+  DeleteBackupsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DeleteBackupsLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - backup.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeleteOldBackupsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - backup:ListRecoveryPointsByBackupVault
+                  - backup:DeleteRecoveryPoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+
+  # Lambda Function to delete old backups
+  DeleteBackupsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DeleteOldBackupsFunction
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DeleteBackupsLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          BACKUP_VAULT_NAME: !Ref BackupVaultName
+          EXPIRY_DAYS: !Ref ExpiryDays
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import datetime
+          from datetime import timezone
+
+          def lambda_handler(event, context):
+              backup_client = boto3.client('backup')
+              vault_name = os.environ['BACKUP_VAULT_NAME']
+              expiry_days = int(os.environ['EXPIRY_DAYS'])
+
+              cutoff_date = datetime.datetime.utcnow().replace(tzinfo=timezone.utc) - datetime.timedelta(days=expiry_days)
+              next_token = None
+
+              try:
+                  while True:
+                      request_params = {
+                          "BackupVaultName": vault_name,
+                          "MaxResults": 100
+                      }
+                      if next_token:
+                          request_params["NextToken"] = next_token
+
+                      response = backup_client.list_recovery_points_by_backup_vault(**request_params)
+
+                      for recovery_point in response.get('RecoveryPoints', []):
+                          recovery_point_arn = recovery_point['RecoveryPointArn']
+                          completion_date = recovery_point['CompletionDate'].replace(tzinfo=timezone.utc)
+
+                          if completion_date < cutoff_date:
+                              try:
+                                  backup_client.delete_recovery_point(BackupVaultName=vault_name, RecoveryPointArn=recovery_point_arn)
+                                  print(f"Deleted backup: {recovery_point_arn} (Created: {completion_date})")
+                              except Exception as delete_err:
+                                  print(f"Failed to delete backup {recovery_point_arn}: {delete_err}")
+
+                      next_token = response.get('NextToken')
+                      if not next_token:
+                          print("All eligible backups processed.")
+                          break
+
+              except Exception as e:
+                  print(f"Error processing backup deletions: {str(e)}")
+                  raise
+
+  # CloudWatch Event Rule to trigger the Lambda function daily
+  DeleteBackupsEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DeleteBackupsTrigger
+      ScheduleExpression: rate(1 day)  # Runs every day
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DeleteBackupsFunction.Arn
+          Id: "DeleteBackupsLambdaTarget"
+
+  PermissionForEventToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteBackupsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeleteBackupsEventRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: "Name of the Lambda function"
+    Value: !Ref DeleteBackupsFunction
+  LambdaExecutionRole:
+    Description: "The IAM role used by the Lambda function"
+    Value: !GetAtt DeleteBackupsLambdaRole.Arn

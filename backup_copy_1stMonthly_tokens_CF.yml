@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys an AWS Lambda function that copies the first day of the month backups from one Backup Vault to another by Instance ID.  It allows you to update lifecycle policies during the process.  This also deploys an EventBridge rule to run everyday for continuous backup copies.
+
+Parameters:
+  SourceBackupVault:
+    Type: String
+    Description: Name of the source backup vault.
+
+  DestinationBackupVault:
+    Type: String
+    Description: Name of the destination backup vault.
+
+  InstanceId:
+    Type: String
+    Description: The EC2 Instance ID to filter backups.
+
+  MoveToColdStorageAfterDays:
+    Type: Number
+    Default: 30
+    Description: Number of days before the backup is moved to cold storage (set to 0 to disable).
+
+  DeleteAfterDays:
+    Type: Number
+    Default: 120
+    Description: Number of days before the backup is deleted.
+
+Resources:
+  # IAM Role for Lambda function
+  BackupCopyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BackupCopyLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - backup.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BackupCopyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - backup:ListRecoveryPointsByBackupVault
+                  - backup:StartCopyJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+
+  # Lambda Function to copy backups with lifecycle policies and Instance ID filtering
+  BackupCopyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BackupCopyFunction
+      Runtime: python3.9
+      Role: !GetAtt BackupCopyLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 300  # Set timeout for the Lambda function (5 minutes)
+      MemorySize: 128  # Adjust memory size as needed
+      Environment:
+        Variables:
+          SOURCE_VAULT: !Ref SourceBackupVault
+          DESTINATION_VAULT: !Ref DestinationBackupVault
+          INSTANCE_ID: !Ref InstanceId
+          MOVE_TO_COLD_STORAGE: !Ref MoveToColdStorageAfterDays
+          DELETE_AFTER_DAYS: !Ref DeleteAfterDays
+      Code:
+        ZipFile: |
+           import boto3
+           import os
+           import datetime
+           from datetime import timezone
+           def lambda_handler(event, context):
+               backup_client = boto3.client('backup')
+               aws_region = context.invoked_function_arn.split(":")[3]
+               account_id = context.invoked_function_arn.split(":")[4]
+
+               source_vault = os.environ['SOURCE_VAULT']
+               destination_vault = os.environ['DESTINATION_VAULT']
+               instance_id = os.environ['INSTANCE_ID']
+               move_to_cold = int(os.environ['MOVE_TO_COLD_STORAGE'])
+               delete_after = int(os.environ['DELETE_AFTER_DAYS'])
+               years_to_check = 5  # Adjust this to go back further in time
+
+               # Generate first-day-of-month dates for multiple years
+               today = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+               first_days = {
+                   today.replace(year=today.year - y, month=m, day=1)
+                   for y in range(years_to_check)  # Go back 'years_to_check' years
+                   for m in range(1, 13)  # Loop through all 12 months
+               }
+
+               try:
+                   next_token = None  # Initialize Token
+
+                   while True:
+                   # Build request parameters dynamically (omit NextToken if None)
+                       request_params = {
+                           "BackupVaultName": source_vault,
+                           "MaxResults": 100  # Fetch max allowed per call
+                       }
+                       if next_token:
+                           request_params["NextToken"] = next_token  # Add only if valid
+
+                       # Fetch recovery points (with Tokens)
+                       response = backup_client.list_recovery_points_by_backup_vault(**request_params)
+
+                       for recovery_point in response.get('RecoveryPoints', []):
+                           recovery_point_arn = recovery_point['RecoveryPointArn']
+                           resource_arn = recovery_point['ResourceArn']
+                           completion_date = recovery_point['CompletionDate']
+
+                           # Convert to UTC datetime and check if it was created on the first of the month
+                           backup_date = completion_date.replace(tzinfo=timezone.utc)
+
+                           # Check if the backup was created on ANY first-day-of-the-month in the last X years
+                           if backup_date.date() in {day.date() for day in first_days}:
+                               # Ensure the recovery point belongs to the specified EC2 instance
+                               if instance_id in resource_arn:
+                                   lifecycle_policy = {}
+                                   if move_to_cold > 0:
+                                       lifecycle_policy["MoveToColdStorageAfterDays"] = move_to_cold
+                                   if delete_after > 0:
+                                       lifecycle_policy["DeleteAfterDays"] = delete_after
+
+                                   copy_response = backup_client.start_copy_job(
+                                       RecoveryPointArn=recovery_point_arn,
+                                       SourceBackupVaultName=source_vault,
+                                       DestinationBackupVaultArn=f"arn:aws:backup:{aws_region}:{account_id}:backup-vault:{destination_vault}",
+                                       IamRoleArn=f"arn:aws:iam::{account_id}:role/service-role/AWSBackupDefaultServiceRole",
+                                       Lifecycle=lifecycle_policy
+                                   )
+
+                                   print(f"Copy job {copy_response['CopyJobId']} started for {recovery_point_arn} (Created: {backup_date}) with lifecycle {lifecycle_policy}")
+                               else:
+                                   print(f"Skipping recovery point {recovery_point_arn} - Not associated with instance {instance_id}")
+                           else:
+                               print(f"Skipping backup {recovery_point_arn} - Not from the first day of a month (Created: {backup_date})")
+
+                       # Check Next Token
+                       next_token = response.get('NextToken')  # Get next token, if exists
+                       if not next_token:
+                           print("All eligible backups processed.")
+                           break  # Exit loop when all tokens are processed
+
+               except Exception as e:
+                   print(f"Error while copying backup: {str(e)}")
+                   raise
+
+
+
+  # CloudWatch Event Rule to trigger the Lambda function (optional)
+  BackupCopyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: BackupCopyTrigger
+      ScheduleExpression: rate(1 day)  # Runs every day
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BackupCopyFunction.Arn
+          Id: "BackupCopyLambdaTarget"
+
+  PermissionForEventToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackupCopyFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BackupCopyEventRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: "Name of the Lambda function"
+    Value: !Ref BackupCopyFunction
+  LambdaExecutionRole:
+    Description: "The IAM role used by Lambda function"
+    Value: !GetAtt BackupCopyLambdaRole.Arn
